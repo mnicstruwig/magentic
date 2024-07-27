@@ -2,7 +2,7 @@ import json
 from collections.abc import AsyncIterator, Callable, Iterable, Iterator
 from enum import Enum
 from functools import singledispatch
-from itertools import chain, dropwhile, groupby
+from itertools import chain, dropwhile, groupby, tee
 from typing import Any, AsyncIterable, Generic, Sequence, TypeVar, cast, overload
 
 from pydantic import ValidationError
@@ -34,6 +34,7 @@ from magentic.function_call import (
     FunctionCall,
     ParallelFunctionCall,
     _create_unique_id,
+    StreamedResponse,
 )
 from magentic.streaming import (
     AsyncStreamedStr,
@@ -217,7 +218,7 @@ def parse_streamed_tool_calls(
     all_tool_call_chunks = (
         cast(ContentBlockStartEvent | ContentBlockDeltaEvent, chunk)
         for chunk in response
-        if chunk.type in ("content_block_start", "content_block_delta")
+        if chunk.type in ("content_block_end", "content_block_delta")
     )
     for _, tool_call_chunks in groupby(all_tool_call_chunks, lambda x: x.index):
         first_chunk = next(tool_call_chunks)
@@ -314,41 +315,56 @@ def _create_usage_ref_async(
 
 
 def _extract_thinking(
-    response: Iterator[ToolsBetaMessageStreamEvent],
-) -> tuple[str | None, Iterator[ToolsBetaMessageStreamEvent]]:
+    response: Iterator[MessageStreamEvent],
+) -> tuple[str | None, Iterator[MessageStreamEvent]]:
     """Extract the <thinking>...</thinking> block from the response."""
+
+    print("EXTRACTING THINKING SYNC!")
     first_chunk = next(response)
     if not (
         first_chunk.type == "content_block_start"
         and first_chunk.content_block.type == "text"
     ):
+        print("NO THINKING!")
         return None, chain([first_chunk], response)
 
     second_chunk = next(response)
+    _ = next(response)  # Is a TextEvent for the second chunk
+    third_chunk = next(response)
+    third_chunk_text_event = next(response)
+
     assert second_chunk.type == "content_block_delta"  # noqa: S101
     assert second_chunk.delta.type == "text_delta"  # noqa: S101
-    if not second_chunk.delta.text.startswith("<thinking>"):
+    # The `<thinking>` part of the completion is split over multiple tokens in the case of Claude 3.5 Sonnet.
+    # This is why we use the third chunk.
+    if not third_chunk_text_event.snapshot.startswith("<thinking>"):
+        print("No thinking either...")
         return None, chain([first_chunk, second_chunk], response)
 
-    thinking = second_chunk.delta.text.removeprefix("<thinking>").lstrip()
+    #thinking = second_chunk.delta.text.removeprefix("<thinking>").lstrip()
+    thinking = third_chunk_text_event.snapshot.removeprefix("<thinking>").lstrip()
     for chunk in response:
-        assert chunk.type == "content_block_delta"  # noqa: S101
-        assert chunk.delta.type == "text_delta"  # noqa: S101
-        thinking += chunk.delta.text
+        breakpoint()
+        print(chunk)
+        if chunk.type == "text":
+            thinking += chunk.text
         if "</thinking>" in thinking:
+            breakpoint()
             break
     thinking = thinking.rstrip().removesuffix("</thinking>").rstrip()
     first_chunk = next(response)
     # content_block_stop encountered if switching to tool calls
     if first_chunk.type == "content_block_stop":
         first_chunk = next(response)
+    print(f"THINKING: {thinking}")
     return thinking, chain([first_chunk], response)
 
 
 async def _aextract_thinking(
-    response: AsyncIterator[ToolsBetaMessageStreamEvent],
-) -> tuple[str | None, AsyncIterator[ToolsBetaMessageStreamEvent]]:
+    response: AsyncIterator[MessageStreamEvent],
+) -> tuple[str | None, AsyncIterator[MessageStreamEvent]]:
     """Async version of `_extract_thinking`."""
+    print("EXTRACTING THINKING")
     first_chunk = await anext(response)
     if not (
         first_chunk.type == "content_block_start"
@@ -383,6 +399,7 @@ R = TypeVar("R")
 STR_OR_FUNCTIONCALL_TYPE = (
     str,
     StreamedStr,
+    StreamedResponse,
     AsyncStreamedStr,
     FunctionCall,
     ParallelFunctionCall,
@@ -487,8 +504,9 @@ class AnthropicChatModel(ChatModel):
         tool_schemas = [FunctionToolSchema(schema) for schema in function_schemas]
 
         str_in_output_types = is_any_origin_subclass(output_types, str)
-        streamed_str_in_output_types = is_any_origin_subclass(output_types, StreamedStr)
-        allow_string_output = str_in_output_types or streamed_str_in_output_types
+        streamed_str_or_streamed_response_in_output_types = is_any_origin_subclass(output_types, StreamedStr) or is_any_origin_subclass(output_types, StreamedResponse)
+        #streamed_str_in_output_types = is_any_origin_subclass(output_types, StreamedStr)
+        allow_string_output = str_in_output_types or streamed_str_or_streamed_response_in_output_types
 
         system, messages = _extract_system_message(messages)
 
@@ -516,8 +534,43 @@ class AnthropicChatModel(ChatModel):
         response = _response_generator()
         usage_ref, response = _create_usage_ref(response)
         response = dropwhile(lambda x: x.type != "content_block_start", response)
-        _, response = _extract_thinking(response)
+        #_, response = _extract_thinking(response)
         first_chunk, response = peek(response)
+
+        def handle_stream(response: Iterator[MessageStreamEvent]) -> Iterator[StreamedStr | FunctionCall]:
+            response1, response2 = tee(response, 2)
+            for chunk in response1:
+                if chunk.type == "content_block_start" and chunk.content_block.type == "text":
+                    yield StreamedStr(
+                        chunk.delta.text
+                        for chunk in response1
+                        if chunk.type == "content_block_delta"
+                        and chunk.delta.type == "text_delta"
+                    )
+            for chunk in response2:
+                breakpoint()
+                print("as")
+                yield parse_streamed_tool_calls(response2, tool_schemas)
+                # function_call_json = ""
+                # if chunk.type =="content_block_stop" and chunk.content_block.type == "tool_use":
+                #     function_name = chunk.content_block.name
+                #     function_args = chunk.content_block.input
+
+            
+        stream = handle_stream(response=response)
+        element = next(stream)
+        element2 = next(stream)
+        breakpoint()
+        print("Eish")
+        if isinstance(element, StreamedStr):
+            str_content = validate_str_content(
+                element,
+                allow_string_output=allow_string_output,
+                streamed=streamed_str_or_streamed_response_in_output_types,
+            )
+            streamed_respose = StreamedResponse(sections=[str_content])
+            return AssistantMessage._with_usage(streamed_respose, usage_ref)
+
 
         if (
             first_chunk.type == "content_block_start"
@@ -535,8 +588,10 @@ class AnthropicChatModel(ChatModel):
             str_content = validate_str_content(
                 streamed_str,
                 allow_string_output=allow_string_output,
-                streamed=streamed_str_in_output_types,
+                streamed=streamed_str_or_streamed_response_in_output_types,
             )
+            streamed_response = StreamedResponse(sections=[str_content])
+            return AssistantMessage._with_usage(streamed_response, usage_ref)
             return AssistantMessage._with_usage(str_content, usage_ref)  # type: ignore[return-value]
 
         if (

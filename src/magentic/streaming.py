@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from itertools import chain, dropwhile
 from typing import AsyncIterator, Callable, Iterator, TypeVar
 
+
 T = TypeVar("T")
 
 
@@ -235,7 +236,6 @@ class StreamedStr(Iterable[str]):
             if current_length > length:
                 break
         return textwrap.shorten("".join(chunks), width=length)
-
 
 class AsyncStreamedStr(AsyncIterable[str]):
     """Async version of `StreamedStr`."""

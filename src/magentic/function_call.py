@@ -1,4 +1,5 @@
 import asyncio
+from collections.abc import Iterable
 import inspect
 from typing import (
     Any,
@@ -18,7 +19,7 @@ from uuid import uuid4
 
 import logfire_api as logfire
 
-from magentic.streaming import CachedAsyncIterable, CachedIterable
+from magentic.streaming import CachedAsyncIterable, CachedIterable, StreamedStr
 
 T = TypeVar("T")
 P = ParamSpec("P")
@@ -125,3 +126,13 @@ class AsyncParallelFunctionCall(Generic[T]):
     async def __aiter__(self) -> AsyncIterator[FunctionCall[Awaitable[T] | T]]:
         async for function_call in self._function_calls:
             yield function_call
+
+
+class StreamedResponse(Iterable[StreamedStr | FunctionCall]):
+    """A streamed response from a chat model."""
+
+    def __init__(self, sections: Iterable[StreamedStr | FunctionCall]):
+        self._sections = sections
+
+    def __iter__(self) -> Iterator[StreamedStr | FunctionCall]:
+        yield from self._sections
