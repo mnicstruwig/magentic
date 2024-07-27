@@ -553,20 +553,21 @@ class AnthropicChatModel(ChatModel):
 
             
         stream = handle_stream(response=response)
-        sections = []
-        for output in stream:
-            if isinstance(output, StreamedStr):
-                str_content = validate_str_content(
-                    output,
-                    allow_string_output=allow_string_output,
-                    streamed=streamed_str_or_streamed_response_in_output_types,
-                )
-                sections.append(str_content)
-            elif isinstance(output, FunctionCall):
-                sections.append(output)
-        breakpoint() 
-        streamed_respose = StreamedResponse(sections=sections)
-        return AssistantMessage._with_usage(streamed_respose, usage_ref)
+        # sections = []
+        # for output in stream:
+        #     if isinstance(output, StreamedStr):
+        #         breakpoint()
+        #         str_content = validate_str_content(
+        #             output,
+        #             allow_string_output=allow_string_output,
+        #             streamed=streamed_str_or_streamed_response_in_output_types,
+        #         )
+        #         sections.append(str_content)
+        #     elif isinstance(output, FunctionCall):
+        #         sections.append(output)
+        # breakpoint() 
+        streamed_response = StreamedResponse(sections=stream)
+        return AssistantMessage._with_usage(streamed_response, usage_ref)
 
         if (
             first_chunk.type == "content_block_start"
