@@ -4,6 +4,7 @@ from enum import Enum
 from functools import singledispatch
 from itertools import chain, dropwhile, groupby, tee
 from typing import Any, AsyncIterable, Generic, Sequence, TypeVar, cast, overload
+from anthropic import ContentBlockStopEvent
 
 from pydantic import ValidationError
 
@@ -192,12 +193,9 @@ def select_tool_schema(
 
 
 class FunctionToolSchema(BaseFunctionToolSchema[FunctionSchema[T]]):
-    def parse_tool_call(self, chunks: Iterable[MessageStreamEvent]) -> T:
+    def parse_tool_call(self, tool_call: ContentBlockStopEvent) -> T:
         return self._function_schema.parse_args(
-            chunk.delta.partial_json
-            for chunk in chunks
-            if chunk.type == "content_block_delta"
-            if chunk.delta.type == "input_json_delta"
+            [json.dumps(tool_call.content_block.input)]  # Needs to be a string iterable
         )
 
 
@@ -215,17 +213,21 @@ def parse_streamed_tool_calls(
     response: Iterable[MessageStreamEvent],
     tool_schemas: Iterable[FunctionToolSchema[T]],
 ) -> Iterator[T]:
-    all_tool_call_chunks = (
-        cast(ContentBlockStartEvent | ContentBlockDeltaEvent, chunk)
+    all_tool_calls = (
+        cast(ContentBlockStopEvent, chunk)
         for chunk in response
-        if chunk.type in ("content_block_end", "content_block_delta")
+        if chunk.type == "content_block_stop" and chunk.content_block.type == "tool_use"
     )
-    for _, tool_call_chunks in groupby(all_tool_call_chunks, lambda x: x.index):
-        first_chunk = next(tool_call_chunks)
-        assert first_chunk.type == "content_block_start"  # noqa: S101
-        assert first_chunk.content_block.type == "tool_use"  # noqa: S101
-        tool_schema = select_tool_schema(first_chunk.content_block, tool_schemas)
-        yield tool_schema.parse_tool_call(tool_call_chunks)  # noqa: B031
+    for tool_call in all_tool_calls:
+        tool_schema = select_tool_schema(tool_call.content_block, tool_schemas)
+        yield tool_schema.parse_tool_call(tool_call)
+
+    # for _, tool_call_chunks in groupby(all_tool_call_chunks, lambda x: x.index):
+    #     first_chunk = next(tool_call_chunks)
+    #     assert first_chunk.type == "content_block_start"  # noqa: S101
+    #     assert first_chunk.content_block.type == "tool_use"  # noqa: S101
+    #     tool_schema = select_tool_schema(first_chunk.content_block, tool_schemas)
+    #     yield tool_schema.parse_tool_call(tool_call_chunks)  # noqa: B031
 
 
 async def aparse_streamed_tool_calls(
@@ -547,30 +549,24 @@ class AnthropicChatModel(ChatModel):
                         if chunk.type == "content_block_delta"
                         and chunk.delta.type == "text_delta"
                     )
-            for chunk in response2:
-                breakpoint()
-                print("as")
-                yield parse_streamed_tool_calls(response2, tool_schemas)
-                # function_call_json = ""
-                # if chunk.type =="content_block_stop" and chunk.content_block.type == "tool_use":
-                #     function_name = chunk.content_block.name
-                #     function_args = chunk.content_block.input
+            yield from parse_streamed_tool_calls(response2, tool_schemas)
 
             
         stream = handle_stream(response=response)
-        element = next(stream)
-        element2 = next(stream)
-        breakpoint()
-        print("Eish")
-        if isinstance(element, StreamedStr):
-            str_content = validate_str_content(
-                element,
-                allow_string_output=allow_string_output,
-                streamed=streamed_str_or_streamed_response_in_output_types,
-            )
-            streamed_respose = StreamedResponse(sections=[str_content])
-            return AssistantMessage._with_usage(streamed_respose, usage_ref)
-
+        sections = []
+        for output in stream:
+            if isinstance(output, StreamedStr):
+                str_content = validate_str_content(
+                    output,
+                    allow_string_output=allow_string_output,
+                    streamed=streamed_str_or_streamed_response_in_output_types,
+                )
+                sections.append(str_content)
+            elif isinstance(output, FunctionCall):
+                sections.append(output)
+        breakpoint() 
+        streamed_respose = StreamedResponse(sections=sections)
+        return AssistantMessage._with_usage(streamed_respose, usage_ref)
 
         if (
             first_chunk.type == "content_block_start"
